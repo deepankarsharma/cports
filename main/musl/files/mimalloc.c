@@ -55,6 +55,17 @@
 
 #define INTERFACE __attribute__((visibility("default")))
 
+#ifndef __has_attribute
+#define __has_attribute(x) 0
+#endif
+
+#if __has_attribute(xray_always_instrument) && __has_attribute(xray_log_args)
+#define XRAY_MALLOC_BYTES \
+	__attribute__((xray_always_instrument, xray_log_args(1), noinline))
+#else
+#define XRAY_MALLOC_BYTES
+#endif
+
 extern int __malloc_replaced;
 extern int __aligned_alloc_replaced;
 
@@ -93,7 +104,7 @@ void __libc_free(void *ptr) {
     mi_free(ptr);
 }
 
-void *__libc_malloc_impl(size_t len) {
+XRAY_MALLOC_BYTES void *__libc_malloc_impl(size_t len) {
     return mi_malloc(len);
 }
 

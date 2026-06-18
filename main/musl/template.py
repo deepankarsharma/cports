@@ -1,6 +1,6 @@
 pkgname = "musl"
 pkgver = "1.2.6"
-pkgrel = 2
+pkgrel = 3
 _commit = "9fa28ece75d8a2191de7c5bb53bed224c5947417"
 _mimalloc_ver = "2.2.7"
 build_style = "gnu_configure"
@@ -73,6 +73,28 @@ def init_configure(self):
     if self.stage == 0:
         self.env["LIBCC_LDFLAGS"] = "--rtlib=compiler-rt"
         return
+
+
+def pre_configure(self):
+    # build the external (mimalloc) allocator object with XRay instrumentation
+    # so the xray_always_instrument annotation on __libc_malloc_impl actually
+    # emits sleds. only relevant when the external allocator is in use.
+    if _use_mng:
+        return
+    mf = self.cwd / "Makefile"
+    needle = "$(CC) -I$(srcdir)/mimalloc/include $(CFLAGS_ALL)"
+    # a high instruction threshold means only functions tagged
+    # xray_always_instrument (i.e. __libc_malloc_impl) get instrumented,
+    # keeping the rest of mimalloc free of sleds
+    repl = (
+        "$(CC) -fxray-instrument -fxray-instruction-threshold=65535"
+        " -fxray-ignore-loops"
+        " -I$(srcdir)/mimalloc/include $(CFLAGS_ALL)"
+    )
+    data = mf.read_text()
+    if data.count(needle) != 1:
+        self.error("could not locate mimalloc compile rule to add XRay flags")
+    mf.write_text(data.replace(needle, repl))
 
 
 def post_build(self):
