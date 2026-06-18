@@ -1,6 +1,6 @@
 pkgname = "musl"
 pkgver = "1.2.6"
-pkgrel = 3
+pkgrel = 4
 _commit = "9fa28ece75d8a2191de7c5bb53bed224c5947417"
 _mimalloc_ver = "2.2.7"
 build_style = "gnu_configure"
@@ -61,11 +61,18 @@ def post_extract(self):
     # copy in our mimalloc unified source
     self.cp(self.files_path / "mimalloc-verify-syms.sh", ".")
     self.cp(self.files_path / "mimalloc.c", "mimalloc/src")
+    # XRay attr-list: forces sleds onto the mman + mem-op entry points (see
+    # pre_configure). Lives at the source root so $(srcdir)/xray-attr-list.txt
+    # resolves during the build.
+    self.cp(self.files_path / "xray-attr-list.txt", ".")
     # now we're ready to get patched
-    # but also remove musl's x86_64 asm memcpy as it's actually
-    # noticeably slower than the c implementation
+    # but also remove musl's x86_64 asm mem-ops so the C implementations are
+    # built instead: memcpy/memmove because the C versions are actually
+    # noticeably faster, and memset additionally so it can carry XRay sleds
+    # (the attr-list force-instruments the C definitions, not the asm).
     self.rm("src/string/x86_64/memcpy.s")
     self.rm("src/string/x86_64/memmove.s")
+    self.rm("src/string/x86_64/memset.s")
 
 
 def init_configure(self):
@@ -76,25 +83,93 @@ def init_configure(self):
 
 
 def pre_configure(self):
-    # build the external (mimalloc) allocator object with XRay instrumentation
-    # so the xray_always_instrument annotation on __libc_malloc_impl actually
-    # emits sleds. only relevant when the external allocator is in use.
+    # Instrument libc with LLVM XRay so the allocator / mman / mem-op entry
+    # points carry patchable sleds. Two complementary mechanisms select what
+    # gets a sled while leaving everything else (notably the startup path)
+    # clean:
+    #   - source-level __attribute__((xray_always_instrument)) on the mimalloc
+    #     allocator entry points (see files/mimalloc.c);
+    #   - the attr-list (files/xray-attr-list.txt) for the mman + mem-op
+    #     functions that live in musl proper (__mmap, memcpy, ...).
+    # A very high instruction threshold plus -fxray-ignore-loops makes the
+    # size/loop heuristics never auto-select anything, so ONLY the two lists
+    # above are instrumented.
+    #
+    # -fxray-shared makes libc.so a registrable XRay DSO: a load-time
+    # constructor registers its sled map with whatever XRay runtime lives in
+    # the executable, so an instrumented program's __xray_patch() can patch
+    # libc's sleds cross-image. The matching libclang_rt.xray-dso runtime is
+    # added to the libc.so link below; its (and the sleds') references to the
+    # XRay runtime's registration entry points / handler globals are satisfied
+    # by the WEAK stubs in files/mimalloc.c, so non-XRay programs (which is
+    # every normal binary, since they all link libc.so) load fine with the
+    # sleds inert.
+    #
+    # Only relevant for the external (mimalloc) allocator path; the 32-bit
+    # mallocng path is left untouched.
     if _use_mng:
         return
-    mf = self.cwd / "Makefile"
-    needle = "$(CC) -I$(srcdir)/mimalloc/include $(CFLAGS_ALL)"
-    # a high instruction threshold means only functions tagged
-    # xray_always_instrument (i.e. __libc_malloc_impl) get instrumented,
-    # keeping the rest of mimalloc free of sleds
-    repl = (
-        "$(CC) -fxray-instrument -fxray-instruction-threshold=65535"
-        " -fxray-ignore-loops"
-        " -I$(srcdir)/mimalloc/include $(CFLAGS_ALL)"
+
+    xray_cflags = (
+        " -fxray-instrument -fxray-shared"
+        " -fxray-instruction-threshold=1000000 -fxray-ignore-loops"
+        " -fxray-attr-list=$(srcdir)/xray-attr-list.txt"
     )
+
+    mf = self.cwd / "Makefile"
     data = mf.read_text()
-    if data.count(needle) != 1:
-        self.error("could not locate mimalloc compile rule to add XRay flags")
-    mf.write_text(data.replace(needle, repl))
+
+    # 1) Add the XRay flags to the global compile flags. CFLAGS_ALL is used by
+    #    every compile rule (including the special mimalloc one), so this
+    #    instruments all of libc uniformly.
+    cflags_needle = "CFLAGS_ALL += $(CPPFLAGS) $(CFLAGS_AUTO) $(CFLAGS)"
+    if data.count(cflags_needle) != 1:
+        self.error("could not locate CFLAGS_ALL definition to add XRay flags")
+    data = data.replace(
+        cflags_needle,
+        cflags_needle + "\nCFLAGS_ALL +=" + xray_cflags,
+    )
+
+    # 2) Link the XRay DSO runtime into libc.so (it provides the sled
+    #    trampolines and the registration constructor). The link uses
+    #    -nostdlib, so clang will not pull it in automatically; add it by the
+    #    path clang reports. Its undefined runtime references are satisfied by
+    #    the weak stubs in mimalloc.o, so --no-undefined stays happy.
+    link_needle = "-Wl,-e,_dlstart -o $@ $(LOBJS) $(LDSO_OBJS) $(LIBCC)"
+    if data.count(link_needle) != 1:
+        self.error("could not locate libc.so link rule to add XRay runtime")
+    data = data.replace(
+        link_needle,
+        "-Wl,-e,_dlstart -o $@ $(LOBJS) $(LDSO_OBJS) $(LIBCC)"
+        " $(shell $(CC) -print-file-name=libclang_rt.xray-dso.a)",
+    )
+
+    mf.write_text(data)
+
+    # 3) musl links libc.so with --dynamic-list, which makes every symbol NOT
+    #    on the list bind *locally* (non-preemptible). Left alone, libc.so's
+    #    own reference to __xray_register_dso would bind to its weak no-op stub
+    #    instead of the strong definition an XRay executable exports, so the
+    #    DSO would never register and cross-image patching would silently do
+    #    nothing. Add the XRay registration symbols to the dynamic list so they
+    #    stay preemptible: an instrumented executable's runtime then overrides
+    #    the stubs, while normal programs still fall back to the weak no-ops.
+    dl = self.cwd / "dynamic.list"
+    dl_data = dl.read_text()
+    dl_needle = "__stack_chk_guard;\n};"
+    if dl_data.count(dl_needle) != 1:
+        self.error("could not locate dynamic.list tail to add XRay symbols")
+    dl_data = dl_data.replace(
+        dl_needle,
+        "__stack_chk_guard;\n\n"
+        "__xray_register_dso;\n"
+        "__xray_deregister_dso;\n"
+        "_ZN6__xray19XRayPatchedFunctionE;\n"
+        "_ZN6__xray13XRayArgLoggerE;\n"
+        "_ZN6__xray21XRayPatchedTypedEventE;\n"
+        "_ZN6__xray22XRayPatchedCustomEventE;\n};",
+    )
+    dl.write_text(dl_data)
 
 
 def post_build(self):

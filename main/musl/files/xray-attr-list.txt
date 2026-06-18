@@ -1,0 +1,26 @@
+# XRay attr-list for the Chimera musl build.
+#
+# musl is compiled with `-fxray-instrument -fxray-instruction-threshold=<big>
+# -fxray-ignore-loops`, so by default NO function is large/loopy enough to be
+# auto-selected. This list force-instruments exactly the mman + mem-op entry
+# points we want to trace, keeping the rest of libc (notably the startup path)
+# sled-free.
+#
+# Names are musl's *source-level* symbols. musl redirects the public POSIX
+# names via macros/weak_alias when building its own sources (e.g. the public
+# `mmap` is defined as `__mmap`), and XRay keys on the definition name, so the
+# `__m*` forms are what match. The mem-ops keep their plain names.
+#
+# Format is the SanitizerSpecialCaseList grammar: `fun:<name>` under a section.
+# The allocator entry points (__libc_malloc_impl, __libc_free, ...) are NOT
+# listed here; they are force-instrumented via source-level
+# __attribute__((xray_always_instrument)) in files/mimalloc.c instead.
+
+[always]
+fun:__mmap
+fun:__munmap
+fun:__mprotect
+fun:__mremap
+fun:memcpy
+fun:memmove
+fun:memset
